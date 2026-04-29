@@ -1,4 +1,5 @@
-import { lazy, Suspense, useState } from 'react';
+import { lazy, Suspense, useEffect, useMemo, useState } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
 import { useSearchParams } from 'react-router-dom';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
@@ -9,12 +10,30 @@ import { Separator } from '@/components/ui/separator';
 import { Switch } from '@/components/ui/switch';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { useAuth } from '@/contexts/AuthContext';
 import { users } from '@/data/seed';
 import { DEFAULT_ROLE_MODULE_CONFIG } from '@/services/auth/moduleAccess';
-import { Wrench, Building2, Users, Palette, Lock, Upload, Check, FileText, Eye, LayoutGrid, LayoutDashboard, KanbanSquare, Calendar, Receipt, Settings as SettingsIcon, Info } from 'lucide-react';
+import { Wrench, Building2, Users, Palette, Lock, Upload, Check, FileText, Eye, LayoutGrid, LayoutDashboard, KanbanSquare, Calendar, Receipt, Settings as SettingsIcon, Info, Loader2, Search, Wallet, Shield, KeyRound } from 'lucide-react';
 import { useToast } from '@/hooks/use-toast';
-import type { IntakeNote, IntakeService, Client, RoleModuleConfig, UserRole } from '@/types';
+import { lookupCnpj, stripDigits } from '@/services/domain/customers';
+import { useSystemUsersQuery } from '@/hooks/useSystemUsersQuery';
+import { callAdminUsersFunction } from '@/api/supabase/admin-users';
+import { isSuperAdmin as checkIsSuperAdmin } from '@/services/auth/superAdmin';
+import {
+  DEFAULT_USER_TEMPLATE_SETTINGS,
+  getConfiguracaoModeloUsuario,
+  upsertConfiguracaoModeloUsuario,
+  type ClosingTemplateMode,
+  type OsTemplateMode,
+} from '@/api/supabase/modelos';
+import {
+  DEFAULT_USER_COMPANY_SETTINGS,
+  getConfiguracaoEmpresaUsuario,
+  upsertConfiguracaoEmpresaUsuario,
+  type UserCompanySettings,
+} from '@/api/supabase/empresa';
+import type { AppModuleKey, IntakeNote, IntakeService, Client, SystemUser } from '@/types';
 
 const OSPreviewModal = lazy(() => import('@/components/OSPreviewModal'));
 
@@ -56,71 +75,306 @@ const mockServicesLong: IntakeService[] = [
 ];
 
 // Module definitions for RBAC
-const MODULE_DEFS = [
-  { key: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
-  { key: 'clients', label: 'Clientes', icon: Users },
-  { key: 'notes', label: 'Notas de Entrada', icon: FileText },
-  { key: 'kanban', label: 'Kanban', icon: KanbanSquare },
-  { key: 'closing', label: 'Fechamento', icon: Calendar },
-  { key: 'invoices', label: 'Nota Fiscal (fora da v1)', icon: Receipt },
-  { key: 'settings', label: 'Configurações', icon: SettingsIcon },
+const MODULE_DEFS: { key: AppModuleKey; label: string; description: string; icon: typeof LayoutDashboard }[] = [
+  { key: 'dashboard', label: 'Dashboard', description: 'Indicadores operacionais do sistema.', icon: LayoutDashboard },
+  { key: 'clients', label: 'Clientes', description: 'Cadastro e consulta de clientes.', icon: Users },
+  { key: 'notes', label: 'Notas de Entrada', description: 'Ordens de serviço, edição, preview e PDF.', icon: FileText },
+  { key: 'kanban', label: 'Kanban', description: 'Acompanhamento da produção por status.', icon: KanbanSquare },
+  { key: 'closing', label: 'Fechamento', description: 'Geração de fechamento mensal.', icon: Calendar },
+  { key: 'payables', label: 'Contas a Pagar', description: 'Financeiro, anexos e importação com IA.', icon: Wallet },
+  { key: 'invoices', label: 'Nota Fiscal', description: 'Fora da v1; manter desligado até liberação.', icon: Receipt },
+  { key: 'settings', label: 'Configurações', description: 'Ajustes e prévias do sistema.', icon: SettingsIcon },
+  { key: 'admin', label: 'Admin', description: 'Usuários e permissões administrativas.', icon: Shield },
 ];
 
-const CONFIGURABLE_ROLES: { key: UserRole; label: string }[] = [
-  { key: 'FINANCEIRO', label: 'Financeiro' },
-  { key: 'PRODUCAO', label: 'Produção' },
-  { key: 'RECEPCAO', label: 'Recepção' },
-];
-
-const COMPANY_SETTINGS_CONNECTED = false;
-const MODULE_SETTINGS_CONNECTED = false;
+const IS_REAL_AUTH = import.meta.env.VITE_AUTH_MODE === 'real';
+const COMPANY_SETTINGS_CONNECTED = IS_REAL_AUTH;
 const APPEARANCE_SETTINGS_CONNECTED = false;
-const DOCUMENT_MODEL_SETTINGS_CONNECTED = false;
 const SECURITY_SETTINGS_CONNECTED = false;
 const SETTINGS_TABS = new Set(['empresa', 'modulos', 'aparencia', 'modelos', 'seguranca', 'usuarios']);
+const HEX_COLOR_PATTERN = /^#[0-9a-fA-F]{6}$/;
 
 export default function SettingsPage() {
   const { user } = useAuth();
   const { toast } = useToast();
+  const queryClient = useQueryClient();
   const [searchParams, setSearchParams] = useSearchParams();
   const tabFromUrl = searchParams.get('tab') ?? 'empresa';
+  const templateUserFromUrl = searchParams.get('user') ?? '';
   const activeTab = SETTINGS_TABS.has(tabFromUrl) ? tabFromUrl : 'empresa';
+  const { data: systemUsers = [], isLoading: usersLoading } = useSystemUsersQuery();
+  const isSuperAdmin = checkIsSuperAdmin(user);
 
   // Company
-  const [companyName, setCompanyName] = useState('Retífica Premium');
-  const [fantasyName, setFantasyName] = useState('Premium Retífica de Cabeçote');
-  const [cnpj, setCnpj] = useState('12.345.678/0001-90');
-  const [ie, setIe] = useState('123.456.789.000');
-  const [im, setIm] = useState('98765');
-  const [companyAddress, setCompanyAddress] = useState('Rua das Indústrias, 450');
-  const [companyCity, setCompanyCity] = useState('São Paulo');
-  const [companyState, setCompanyState] = useState('SP');
-  const [companyCep, setCompanyCep] = useState('01234-567');
-  const [companyPhone, setCompanyPhone] = useState('(11) 3456-7890');
-  const [companyEmail, setCompanyEmail] = useState('contato@retificapremium.com.br');
-  const [companySite, setCompanySite] = useState('www.retificapremium.com.br');
+  const [companyName, setCompanyName] = useState(DEFAULT_USER_COMPANY_SETTINGS.razaoSocial);
+  const [fantasyName, setFantasyName] = useState(DEFAULT_USER_COMPANY_SETTINGS.nomeFantasia);
+  const [cnpj, setCnpj] = useState(DEFAULT_USER_COMPANY_SETTINGS.cnpj);
+  const [ie, setIe] = useState(DEFAULT_USER_COMPANY_SETTINGS.inscricaoEstadual);
+  const [im, setIm] = useState(DEFAULT_USER_COMPANY_SETTINGS.inscricaoMunicipal);
+  const [companyAddress, setCompanyAddress] = useState(DEFAULT_USER_COMPANY_SETTINGS.endereco);
+  const [companyCity, setCompanyCity] = useState(DEFAULT_USER_COMPANY_SETTINGS.cidade);
+  const [companyState, setCompanyState] = useState(DEFAULT_USER_COMPANY_SETTINGS.estado);
+  const [companyCep, setCompanyCep] = useState(DEFAULT_USER_COMPANY_SETTINGS.cep);
+  const [companyPhone, setCompanyPhone] = useState(DEFAULT_USER_COMPANY_SETTINGS.telefone);
+  const [companyEmail, setCompanyEmail] = useState(DEFAULT_USER_COMPANY_SETTINGS.email);
+  const [companySite, setCompanySite] = useState(DEFAULT_USER_COMPANY_SETTINGS.site);
   const [logoPreview, setLogoPreview] = useState<string | null>(null);
+  const [cnpjLoading, setCnpjLoading] = useState(false);
+  const [companyLoading, setCompanyLoading] = useState(false);
+  const [companySaving, setCompanySaving] = useState(false);
 
   // Security
   const [currentPassword, setCurrentPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
+  const [selectedResetUserId, setSelectedResetUserId] = useState('');
+  const [resetConfirmationEmail, setResetConfirmationEmail] = useState('');
+  const [resetSending, setResetSending] = useState(false);
 
   // Theme
   const [selectedTheme, setSelectedTheme] = useState(0);
-  const [docAccentColor, setDocAccentColor] = useState(DOC_ACCENT_PRESETS[0].color);
   const [showA5Preview, setShowA5Preview] = useState(false);
   const [showA4Preview, setShowA4Preview] = useState(false);
+  const [selectedTemplateUserId, setSelectedTemplateUserId] = useState('');
+  const [templateDraft, setTemplateDraft] = useState({
+    osModelo: DEFAULT_USER_TEMPLATE_SETTINGS.osModelo,
+    corDocumento: DEFAULT_USER_TEMPLATE_SETTINGS.corDocumento,
+    fechamentoModelo: DEFAULT_USER_TEMPLATE_SETTINGS.fechamentoModelo,
+    corFechamento: DEFAULT_USER_TEMPLATE_SETTINGS.corFechamento,
+  });
+  const [templateLoading, setTemplateLoading] = useState(false);
+  const [templateSaving, setTemplateSaving] = useState(false);
 
   // Modules
-  const [moduleConfig, setModuleConfig] = useState<RoleModuleConfig>(DEFAULT_ROLE_MODULE_CONFIG);
+  const [selectedModuleUserId, setSelectedModuleUserId] = useState('');
+  const [moduleSavingKey, setModuleSavingKey] = useState<AppModuleKey | null>(null);
+  const selectedModuleUser = useMemo(
+    () => systemUsers.find((candidate) => candidate.id === selectedModuleUserId) ?? null,
+    [selectedModuleUserId, systemUsers],
+  );
 
-  const toggleModule = (role: UserRole, mod: keyof typeof DEFAULT_ROLE_MODULE_CONFIG.ADMIN) => {
-    if (!MODULE_SETTINGS_CONNECTED) return;
-    setModuleConfig(prev => ({
-      ...prev,
-      [role]: { ...prev[role], [mod]: !prev[role]?.[mod] },
-    }));
+  const applyCompanySettings = (settings: UserCompanySettings) => {
+    setCompanyName(settings.razaoSocial);
+    setFantasyName(settings.nomeFantasia);
+    setCnpj(settings.cnpj);
+    setIe(settings.inscricaoEstadual);
+    setIm(settings.inscricaoMunicipal);
+    setCompanyAddress(settings.endereco);
+    setCompanyCity(settings.cidade);
+    setCompanyState(settings.estado);
+    setCompanyCep(settings.cep);
+    setCompanyPhone(settings.telefone);
+    setCompanyEmail(settings.email);
+    setCompanySite(settings.site);
+  };
+
+  const buildCompanyPayload = () => ({
+    razaoSocial: companyName,
+    nomeFantasia: fantasyName,
+    cnpj,
+    inscricaoEstadual: ie,
+    inscricaoMunicipal: im,
+    endereco: companyAddress,
+    cidade: companyCity,
+    estado: companyState,
+    cep: companyCep,
+    telefone: companyPhone,
+    email: companyEmail,
+    site: companySite,
+  });
+
+  useEffect(() => {
+    if (!IS_REAL_AUTH) return;
+    let active = true;
+    setCompanyLoading(true);
+    getConfiguracaoEmpresaUsuario()
+      .then((settings) => {
+        if (!active) return;
+        applyCompanySettings(settings);
+      })
+      .catch((error) => {
+        if (!active) return;
+        toast({
+          title: 'Não foi possível carregar a empresa',
+          description: error instanceof Error ? error.message : 'Tente novamente.',
+          variant: 'destructive',
+        });
+      })
+      .finally(() => {
+        if (active) setCompanyLoading(false);
+      });
+    return () => { active = false; };
+  }, [toast]);
+
+  useEffect(() => {
+    if (!selectedModuleUserId && systemUsers.length > 0) {
+      setSelectedModuleUserId(systemUsers[0].id);
+    }
+  }, [selectedModuleUserId, systemUsers]);
+
+  useEffect(() => {
+    if (!selectedResetUserId && systemUsers.length > 0) {
+      setSelectedResetUserId(systemUsers[0].id);
+    }
+  }, [selectedResetUserId, systemUsers]);
+
+  useEffect(() => {
+    if (isSuperAdmin && templateUserFromUrl && systemUsers.some((candidate) => candidate.id === templateUserFromUrl)) {
+      if (selectedTemplateUserId === templateUserFromUrl) return;
+      setSelectedTemplateUserId(templateUserFromUrl);
+      return;
+    }
+    if (selectedTemplateUserId || systemUsers.length === 0) return;
+    const ownUser = user ? systemUsers.find((candidate) => candidate.id === user.id) : null;
+    setSelectedTemplateUserId((isSuperAdmin ? systemUsers[0] : ownUser ?? systemUsers[0]).id);
+  }, [isSuperAdmin, selectedTemplateUserId, systemUsers, templateUserFromUrl, user]);
+
+  const selectedTemplateUser = useMemo(
+    () => systemUsers.find((candidate) => candidate.id === selectedTemplateUserId) ?? null,
+    [selectedTemplateUserId, systemUsers],
+  );
+
+  useEffect(() => {
+    if (!selectedTemplateUserId) return;
+    if (!IS_REAL_AUTH) {
+      setTemplateDraft({
+        osModelo: DEFAULT_USER_TEMPLATE_SETTINGS.osModelo,
+        corDocumento: DEFAULT_USER_TEMPLATE_SETTINGS.corDocumento,
+        fechamentoModelo: DEFAULT_USER_TEMPLATE_SETTINGS.fechamentoModelo,
+        corFechamento: DEFAULT_USER_TEMPLATE_SETTINGS.corFechamento,
+      });
+      return;
+    }
+    let active = true;
+    setTemplateLoading(true);
+    getConfiguracaoModeloUsuario(selectedTemplateUserId)
+      .then((settings) => {
+        if (!active) return;
+        setTemplateDraft({
+          osModelo: settings.osModelo,
+          corDocumento: settings.corDocumento,
+          fechamentoModelo: settings.fechamentoModelo,
+          corFechamento: settings.corFechamento,
+        });
+      })
+      .catch((error) => {
+        if (!active) return;
+        toast({
+          title: 'Não foi possível carregar os modelos',
+          description: error instanceof Error ? error.message : 'Tente novamente.',
+          variant: 'destructive',
+        });
+      })
+      .finally(() => {
+        if (active) setTemplateLoading(false);
+      });
+    return () => { active = false; };
+  }, [selectedTemplateUserId, toast]);
+
+  const getModulesForUser = (targetUser: SystemUser) => {
+    return MODULE_DEFS.reduce<Record<AppModuleKey, boolean>>((accumulator, module) => {
+      accumulator[module.key] = targetUser.moduleAccess?.[module.key] ?? DEFAULT_ROLE_MODULE_CONFIG[targetUser.role]?.[module.key] ?? false;
+      return accumulator;
+    }, {} as Record<AppModuleKey, boolean>);
+  };
+
+  const toggleModule = async (moduleKey: AppModuleKey) => {
+    if (!selectedModuleUser) return;
+    if (!isSuperAdmin) {
+      toast({
+        title: 'Ação restrita ao Super Admin',
+        description: 'Somente o admin master pode alterar módulos de usuários.',
+        variant: 'destructive',
+      });
+      return;
+    }
+
+    const currentModules = getModulesForUser(selectedModuleUser);
+    const nextModules = {
+      ...currentModules,
+      [moduleKey]: !currentModules[moduleKey],
+    };
+
+    setModuleSavingKey(moduleKey);
+    try {
+      await callAdminUsersFunction({
+        action: 'set_modules',
+        userId: selectedModuleUser.id,
+        modules: nextModules,
+      });
+      queryClient.setQueryData<SystemUser[]>(['auth', 'system-users'], (previous) =>
+        previous?.map((candidate) =>
+          candidate.id === selectedModuleUser.id ? { ...candidate, moduleAccess: nextModules } : candidate,
+        ) ?? previous,
+      );
+      await queryClient.invalidateQueries({ queryKey: ['auth', 'system-users'] });
+      toast({
+        title: nextModules[moduleKey] ? 'Módulo ativado' : 'Módulo desativado',
+        description: `${MODULE_DEFS.find((module) => module.key === moduleKey)?.label} atualizado para ${selectedModuleUser.name}.`,
+      });
+    } catch (error) {
+      toast({
+        title: 'Não foi possível atualizar o módulo',
+        description: error instanceof Error ? error.message : 'Tente novamente.',
+        variant: 'destructive',
+      });
+    } finally {
+      setModuleSavingKey(null);
+    }
+  };
+
+  const handleSaveTemplateSettings = async () => {
+    if (!selectedTemplateUserId) {
+      toast({ title: 'Selecione um cliente/usuário', variant: 'destructive' });
+      return;
+    }
+    if (!HEX_COLOR_PATTERN.test(templateDraft.corDocumento) || !HEX_COLOR_PATTERN.test(templateDraft.corFechamento)) {
+      toast({
+        title: 'Cor inválida',
+        description: 'Use cores no formato hexadecimal, por exemplo #1a7a8a.',
+        variant: 'destructive',
+      });
+      return;
+    }
+    if (!IS_REAL_AUTH) {
+      toast({
+        title: 'Prévia local atualizada',
+        description: 'Em modo de desenvolvimento, modelos não são persistidos no Supabase.',
+      });
+      return;
+    }
+
+    setTemplateSaving(true);
+    try {
+      const settings = await upsertConfiguracaoModeloUsuario({
+        idUsuarios: selectedTemplateUserId,
+        osModelo: templateDraft.osModelo,
+        corDocumento: templateDraft.corDocumento,
+        fechamentoModelo: templateDraft.fechamentoModelo,
+        corFechamento: templateDraft.corFechamento,
+      });
+      setTemplateDraft({
+        osModelo: settings.osModelo,
+        corDocumento: settings.corDocumento,
+        fechamentoModelo: settings.fechamentoModelo,
+        corFechamento: settings.corFechamento,
+      });
+      await queryClient.invalidateQueries({ queryKey: ['settings', 'templates'] });
+      toast({
+        title: 'Modelos atualizados',
+        description: selectedTemplateUser
+          ? `Configurações salvas para ${selectedTemplateUser.name}.`
+          : 'Configurações salvas no Supabase.',
+      });
+    } catch (error) {
+      toast({
+        title: 'Não foi possível salvar os modelos',
+        description: error instanceof Error ? error.message : 'Tente novamente.',
+        variant: 'destructive',
+      });
+    } finally {
+      setTemplateSaving(false);
+    }
   };
 
   const handleLogoUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -132,11 +386,152 @@ export default function SettingsPage() {
     }
   };
 
+  const handleSaveCompanySettings = async () => {
+    if (!IS_REAL_AUTH) {
+      toast({
+        title: 'Prévia local',
+        description: 'Em modo de desenvolvimento, os dados da empresa não são persistidos no Supabase.',
+      });
+      return;
+    }
+
+    if (stripDigits(cnpj).length !== 14) {
+      toast({
+        title: 'CNPJ incompleto',
+        description: 'Informe um CNPJ com 14 dígitos antes de atualizar.',
+        variant: 'destructive',
+      });
+      return;
+    }
+
+    setCompanySaving(true);
+    try {
+      const saved = await upsertConfiguracaoEmpresaUsuario(buildCompanyPayload());
+      applyCompanySettings(saved);
+      toast({
+        title: 'Empresa atualizada',
+        description: 'Dados salvos no Supabase e mantidos após recarregar a página.',
+      });
+    } catch (error) {
+      toast({
+        title: 'Não foi possível salvar a empresa',
+        description: error instanceof Error ? error.message : 'Tente novamente.',
+        variant: 'destructive',
+      });
+    } finally {
+      setCompanySaving(false);
+    }
+  };
+
+  const handleCompanyCnpjLookup = async () => {
+    if (stripDigits(cnpj).length !== 14) {
+      toast({
+        title: 'CNPJ incompleto',
+        description: 'Informe um CNPJ com 14 dígitos para consultar os dados da empresa.',
+        variant: 'destructive',
+      });
+      return;
+    }
+
+    setCnpjLoading(true);
+    try {
+      const company = await lookupCnpj(cnpj);
+      const nextCompany = {
+        razaoSocial: company.name || companyName || DEFAULT_USER_COMPANY_SETTINGS.razaoSocial,
+        nomeFantasia: company.tradeName || fantasyName || DEFAULT_USER_COMPANY_SETTINGS.nomeFantasia,
+        cnpj,
+        inscricaoEstadual: ie,
+        inscricaoMunicipal: im,
+        email: company.email || companyEmail || DEFAULT_USER_COMPANY_SETTINGS.email,
+        telefone: company.phone || companyPhone || DEFAULT_USER_COMPANY_SETTINGS.telefone,
+        cep: company.cep || companyCep,
+        endereco: [
+        company.address,
+        company.addressNumber,
+        company.district,
+        ].filter(Boolean).join(', ') || companyAddress,
+        cidade: company.city || companyCity,
+        estado: company.state || companyState,
+        site: companySite,
+      };
+      setCompanyName(nextCompany.razaoSocial);
+      setFantasyName(nextCompany.nomeFantasia);
+      setCompanyEmail(nextCompany.email);
+      setCompanyPhone(nextCompany.telefone);
+      setCompanyCep(nextCompany.cep);
+      setCompanyAddress(nextCompany.endereco);
+      setCompanyCity(nextCompany.cidade);
+      setCompanyState(nextCompany.estado);
+
+      if (IS_REAL_AUTH) {
+        const saved = await upsertConfiguracaoEmpresaUsuario(nextCompany);
+        applyCompanySettings(saved);
+        toast({
+          title: 'Dados da empresa preenchidos e salvos',
+          description: 'As informações serão mantidas ao recarregar a página.',
+        });
+        return;
+      }
+
+      toast({ title: 'Dados da GAWI preenchidos pelo CNPJ.' });
+    } catch (error) {
+      toast({
+        title: 'Não foi possível consultar o CNPJ',
+        description: error instanceof Error ? error.message : 'Tente novamente.',
+        variant: 'destructive',
+      });
+    } finally {
+      setCnpjLoading(false);
+    }
+  };
+
   const handlePasswordChange = () => {
     if (!currentPassword) { toast({ title: 'Informe a senha atual', variant: 'destructive' }); return; }
     if (newPassword.length < 6) { toast({ title: 'Mínimo 6 caracteres', variant: 'destructive' }); return; }
     if (newPassword !== confirmPassword) { toast({ title: 'Senhas não coincidem', variant: 'destructive' }); return; }
     toast({ title: 'Senha alterada!' }); setCurrentPassword(''); setNewPassword(''); setConfirmPassword('');
+  };
+
+  const handleAdminPasswordReset = async () => {
+    const targetUser = systemUsers.find((candidate) => candidate.id === selectedResetUserId);
+    if (!targetUser) {
+      toast({ title: 'Selecione um cliente/usuário', variant: 'destructive' });
+      return;
+    }
+    if (!isSuperAdmin) {
+      toast({
+        title: 'Ação restrita ao Admin master',
+        description: 'Somente o Super Admin autorizado pode reenviar recuperação de senha.',
+        variant: 'destructive',
+      });
+      return;
+    }
+
+    setResetSending(true);
+    try {
+      const result = await callAdminUsersFunction({
+        action: 'reset_password',
+        userId: targetUser.id,
+        confirmationEmail: resetConfirmationEmail.trim() || undefined,
+      });
+      toast({
+        title: 'Reset de senha enviado',
+        description: result.confirmationSent
+          ? `Link enviado para ${targetUser.email}; confirmação enviada para ${resetConfirmationEmail.trim()}.`
+          : result.confirmationWarning
+            ? `Link enviado para ${targetUser.email}. Confirmação extra não foi enviada: ${result.confirmationWarning}`
+            : `Link enviado para ${targetUser.email}.`,
+      });
+      setResetConfirmationEmail('');
+    } catch (error) {
+      toast({
+        title: 'Não foi possível enviar reset',
+        description: error instanceof Error ? error.message : 'Tente novamente.',
+        variant: 'destructive',
+      });
+    } finally {
+      setResetSending(false);
+    }
   };
 
   const applyTheme = (idx: number) => {
@@ -156,16 +551,24 @@ export default function SettingsPage() {
     setSearchParams(nextParams, { replace: true });
   };
 
+  const handleTemplateUserChange = (userId: string) => {
+    setSelectedTemplateUserId(userId);
+    const nextParams = new URLSearchParams(searchParams);
+    nextParams.set('tab', 'modelos');
+    nextParams.set('user', userId);
+    setSearchParams(nextParams, { replace: true });
+  };
+
   return (
     <div className="max-w-4xl mx-auto space-y-6">
       <h1 className="text-2xl font-display font-bold">Configurações</h1>
 
       <Alert>
         <Info className="h-4 w-4" />
-        <AlertTitle>Algumas seções ainda são locais</AlertTitle>
+        <AlertTitle>Configurações reais e prévias locais</AlertTitle>
         <AlertDescription>
-          Dados da empresa, permissões por perfil, aparência, modelos e segurança ainda não persistem no backend.
-          O que aparecer como prévia local não deve ser considerado configuração real de produção.
+          Aparência e segurança ainda não persistem no backend. O que aparecer como prévia local não deve ser considerado configuração real de produção;
+          empresa, módulos e modelos já salvam no Supabase quando o sistema está em modo real.
         </AlertDescription>
       </Alert>
 
@@ -185,23 +588,44 @@ export default function SettingsPage() {
             <CardHeader>
               <CardTitle className="flex items-center gap-2">
                 <Building2 className="w-5 h-5" /> Dados da Empresa
-                <Badge variant="outline">Prévia local</Badge>
+                <Badge variant="outline">{COMPANY_SETTINGS_CONNECTED ? 'Supabase' : 'Prévia local'}</Badge>
               </CardTitle>
             </CardHeader>
             <CardContent className="space-y-5">
-              {!COMPANY_SETTINGS_CONNECTED && (
-                <Alert>
-                  <Info className="h-4 w-4" />
-                  <AlertTitle>Prévia local</AlertTitle>
-                  <AlertDescription>
-                    Esta seção ainda serve apenas para pré-visualização no navegador atual. O botão de salvar fica desabilitado até a persistência real ser conectada.
-                  </AlertDescription>
-                </Alert>
+              <Alert>
+                <Info className="h-4 w-4" />
+                <AlertTitle>{COMPANY_SETTINGS_CONNECTED ? 'Persistência real conectada' : 'Prévia local'}</AlertTitle>
+                <AlertDescription>
+                  {COMPANY_SETTINGS_CONNECTED
+                    ? 'Informe o CNPJ para buscar os dados públicos da empresa. Ao buscar ou atualizar, as informações ficam salvas no Supabase e voltam após recarregar a página.'
+                    : 'Esta seção ainda serve apenas para pré-visualização no navegador atual. O botão de salvar fica desabilitado em modo mock/desenvolvimento.'}
+                </AlertDescription>
+              </Alert>
+              {companyLoading && (
+                <div className="flex items-center gap-2 rounded-xl border border-border/70 bg-muted/30 p-4 text-sm text-muted-foreground">
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  Carregando dados da empresa...
+                </div>
               )}
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                 <div><Label>Razão Social</Label><Input value={companyName} onChange={e => setCompanyName(e.target.value)} className="mt-1.5" /></div>
                 <div><Label>Nome Fantasia</Label><Input value={fantasyName} onChange={e => setFantasyName(e.target.value)} className="mt-1.5" /></div>
-                <div><Label>CNPJ</Label><Input value={cnpj} onChange={e => setCnpj(e.target.value)} className="mt-1.5" /></div>
+                <div>
+                  <Label>CNPJ</Label>
+                  <div className="mt-1.5 flex gap-2">
+                    <Input value={cnpj} onChange={e => setCnpj(e.target.value)} />
+                    <Button
+                      type="button"
+                      variant="outline"
+                      className="shrink-0 gap-2"
+                      disabled={cnpjLoading}
+                      onClick={() => void handleCompanyCnpjLookup()}
+                    >
+                      {cnpjLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Search className="h-4 w-4" />}
+                      Buscar
+                    </Button>
+                  </div>
+                </div>
                 <div><Label>Inscrição Estadual</Label><Input value={ie} onChange={e => setIe(e.target.value)} className="mt-1.5" /></div>
                 <div><Label>Inscrição Municipal</Label><Input value={im} onChange={e => setIm(e.target.value)} className="mt-1.5" /></div>
               </div>
@@ -241,8 +665,14 @@ export default function SettingsPage() {
                   </div>
                 </div>
               </div>
-              <Button disabled={!COMPANY_SETTINGS_CONNECTED} aria-disabled={!COMPANY_SETTINGS_CONNECTED}>
-                {COMPANY_SETTINGS_CONNECTED ? 'Salvar Alterações' : 'Persistência em implementação'}
+              <Button
+                onClick={() => void handleSaveCompanySettings()}
+                disabled={!COMPANY_SETTINGS_CONNECTED || companySaving || companyLoading}
+                aria-disabled={!COMPANY_SETTINGS_CONNECTED || companySaving || companyLoading}
+                className="gap-2"
+              >
+                {companySaving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />}
+                Atualizar
               </Button>
             </CardContent>
           </Card>
@@ -253,62 +683,119 @@ export default function SettingsPage() {
           <Card>
             <CardHeader>
               <CardTitle className="flex items-center gap-2">
-                <LayoutGrid className="w-5 h-5" /> Controle de Módulos por Perfil
-                <Badge variant="outline">Bloqueado na v1</Badge>
+                <LayoutGrid className="w-5 h-5" /> Controle de Módulos por Usuário
+                <Badge variant="outline">Supabase</Badge>
               </CardTitle>
             </CardHeader>
             <CardContent className="space-y-5">
               <Alert>
-                <Info className="h-4 w-4" />
-                <AlertTitle>Permissões reais ainda não conectadas nesta tela</AlertTitle>
+                <Shield className="h-4 w-4" />
+                <AlertTitle>Controle real por cliente/usuário</AlertTitle>
                 <AlertDescription>
-                  Estes controles estão bloqueados para não parecerem alteração de backend. A autorização real deve continuar vindo
-                  das permissões do usuário no Supabase/RPCs.
+                  Escolha um usuário abaixo e ligue ou desligue módulos específicos. A alteração é salva no Supabase
+                  pela função administrativa segura e passa a valer no próximo carregamento da sessão desse usuário.
                 </AlertDescription>
               </Alert>
 
-              <div className="overflow-x-auto">
-                <table className="w-full text-sm">
-                  <thead>
-                    <tr className="border-b">
-                      <th className="text-left py-3 pr-4 font-semibold text-muted-foreground">Módulo</th>
-                      {CONFIGURABLE_ROLES.map(r => (
-                        <th key={r.key} className="text-center py-3 px-4 font-semibold text-muted-foreground">{r.label}</th>
+              {!isSuperAdmin && (
+                <Alert className="border-amber-200 bg-amber-50/80 text-amber-900">
+                  <Info className="h-4 w-4" />
+                  <AlertTitle>Ação restrita ao admin master</AlertTitle>
+                  <AlertDescription>
+                    Você pode visualizar os acessos, mas apenas o Super Admin autorizado pode alterar módulos.
+                  </AlertDescription>
+                </Alert>
+              )}
+
+              <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_220px]">
+                <div className="space-y-2">
+                  <Label>Cliente / usuário</Label>
+                  <Select value={selectedModuleUserId} onValueChange={setSelectedModuleUserId} disabled={usersLoading || systemUsers.length === 0}>
+                    <SelectTrigger className="h-11">
+                      <SelectValue placeholder={usersLoading ? 'Carregando usuários...' : 'Selecione um usuário'} />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {systemUsers.map((systemUser) => (
+                        <SelectItem key={systemUser.id} value={systemUser.id}>
+                          {systemUser.name} · {systemUser.email}
+                        </SelectItem>
                       ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {MODULE_DEFS.map(mod => (
-                      <tr key={mod.key} className="border-b last:border-0 hover:bg-muted/30 transition-colors">
-                        <td className="py-3 pr-4">
-                          <div className="flex items-center gap-2.5">
-                            <mod.icon className="w-4 h-4 text-muted-foreground" />
-                            <span className="font-medium">{mod.label}</span>
-                          </div>
-                        </td>
-                        {CONFIGURABLE_ROLES.map(r => (
-                          <td key={r.key} className="text-center py-3 px-4">
-                            <Switch
-                              checked={moduleConfig[r.key]?.[mod.key] ?? false}
-                              disabled={!MODULE_SETTINGS_CONNECTED}
-                              onCheckedChange={() => toggleModule(r.key, mod.key)}
-                            />
-                          </td>
-                        ))}
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+                    </SelectContent>
+                  </Select>
+                </div>
+
+                <div className="rounded-xl border border-border/70 bg-muted/30 p-3">
+                  <p className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">Módulos ativos</p>
+                  <p className="mt-1 text-2xl font-display font-bold">
+                    {selectedModuleUser ? Object.values(getModulesForUser(selectedModuleUser)).filter(Boolean).length : 0}
+                    <span className="text-sm font-medium text-muted-foreground"> / {MODULE_DEFS.length}</span>
+                  </p>
+                </div>
               </div>
 
-              <div className="flex items-center gap-3 p-3 bg-muted/50 rounded-lg">
-                <div className="w-8 h-8 rounded-lg bg-primary/10 flex items-center justify-center">
-                  <Check className="w-4 h-4 text-primary" />
+              {usersLoading ? (
+                <div className="flex items-center gap-2 rounded-xl border border-border/70 bg-muted/30 p-4 text-sm text-muted-foreground">
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  Carregando usuários e permissões...
                 </div>
-                <p className="text-xs text-muted-foreground">
-                  Bloqueado na v1 para evitar configuração local enganosa. Alterações reais exigem persistência no banco.
-                </p>
-              </div>
+              ) : selectedModuleUser ? (
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  {MODULE_DEFS.map((module) => {
+                    const Icon = module.icon;
+                    const modules = getModulesForUser(selectedModuleUser);
+                    const isEnabled = modules[module.key];
+                    const isSaving = moduleSavingKey === module.key;
+                    const isAdminModuleLocked = module.key === 'admin' && selectedModuleUser.role !== 'ADMIN';
+                    const isOwnAdminLock = module.key === 'admin' && selectedModuleUser.id === user?.id;
+
+                    return (
+                      <div
+                        key={module.key}
+                        className="flex items-start justify-between gap-4 rounded-2xl border border-border/70 bg-background p-4 shadow-sm"
+                      >
+                        <div className="min-w-0 space-y-1">
+                          <div className="flex items-center gap-2">
+                            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary">
+                              <Icon className="h-4 w-4" />
+                            </div>
+                            <div className="min-w-0">
+                              <p className="truncate text-sm font-semibold">{module.label}</p>
+                              <Badge variant={isEnabled ? 'default' : 'secondary'} className="mt-1 h-5 text-[10px]">
+                                {isEnabled ? 'Ativo' : 'Bloqueado'}
+                              </Badge>
+                            </div>
+                          </div>
+                          <p className="text-xs leading-relaxed text-muted-foreground">{module.description}</p>
+                          {isAdminModuleLocked && (
+                            <p className="text-[11px] text-muted-foreground">
+                              O módulo Admin só pode ser ligado para usuários administradores.
+                            </p>
+                          )}
+                          {isOwnAdminLock && (
+                            <p className="text-[11px] text-muted-foreground">
+                              Você não pode remover o próprio acesso administrativo por esta tela.
+                            </p>
+                          )}
+                        </div>
+
+                        <div className="flex items-center gap-2 pt-1">
+                          {isSaving && <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />}
+                          <Switch
+                            checked={isEnabled}
+                            disabled={!isSuperAdmin || isSaving || isAdminModuleLocked || isOwnAdminLock}
+                            onCheckedChange={() => void toggleModule(module.key)}
+                            aria-label={`${isEnabled ? 'Desativar' : 'Ativar'} módulo ${module.label} para ${selectedModuleUser.name}`}
+                          />
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : (
+                <div className="rounded-xl border border-dashed border-border p-6 text-center text-sm text-muted-foreground">
+                  Nenhum usuário encontrado para configurar módulos.
+                </div>
+              )}
             </CardContent>
           </Card>
         </TabsContent>
@@ -350,29 +837,176 @@ export default function SettingsPage() {
           </Card>
         </TabsContent>
 
-        {/* MODELOS DA O.S. */}
+        {/* MODELOS */}
         <TabsContent value="modelos">
           <div className="space-y-5">
             <Card>
               <CardHeader>
                 <CardTitle className="flex items-center gap-2">
-                  <FileText className="w-5 h-5" /> Modelos da O.S.
-                  <Badge variant="outline">Prévia local</Badge>
+                  <FileText className="w-5 h-5" /> Modelos do Cliente
+                  <Badge variant="outline">Supabase</Badge>
                 </CardTitle>
               </CardHeader>
               <CardContent className="space-y-5">
-                <p className="text-sm text-muted-foreground">
-                  O formato do documento é selecionado automaticamente com base na quantidade de itens da O.S.
-                </p>
-                {!DOCUMENT_MODEL_SETTINGS_CONNECTED && (
-                  <Alert>
-                    <Info className="h-4 w-4" />
-                    <AlertTitle>Prévia com dados fictícios</AlertTitle>
-                    <AlertDescription>
-                      Os modelos abaixo usam dados mockados só para visualizar layout. Nenhuma regra de template é salva por esta tela.
-                    </AlertDescription>
-                  </Alert>
+                <Alert>
+                  <FileText className="h-4 w-4" />
+                  <AlertTitle>Modelos reais por cliente/usuário</AlertTitle>
+                  <AlertDescription>
+                    Cada cliente pode ter seu próprio modelo e cores. No login master você seleciona o cliente e vê exatamente
+                    o padrão que ele está usando no momento.
+                  </AlertDescription>
+                </Alert>
+
+                <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_220px]">
+                  <div className="space-y-2">
+                    <Label>Cliente / usuário</Label>
+                    <Select
+                      value={selectedTemplateUserId}
+                      onValueChange={handleTemplateUserChange}
+                      disabled={usersLoading || systemUsers.length === 0 || !isSuperAdmin}
+                    >
+                      <SelectTrigger className="h-11">
+                        <SelectValue placeholder={usersLoading ? 'Carregando clientes...' : 'Selecione um cliente'} />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {systemUsers.map((systemUser) => (
+                          <SelectItem key={systemUser.id} value={systemUser.id}>
+                            {systemUser.name} · {systemUser.email}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                    {!isSuperAdmin && (
+                      <p className="text-xs text-muted-foreground">
+                        Você está editando apenas os modelos da sua própria conta.
+                      </p>
+                    )}
+                  </div>
+
+                  <div className="rounded-xl border border-border/70 bg-muted/30 p-3">
+                    <p className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">Cliente selecionado</p>
+                    <p className="mt-1 truncate text-sm font-semibold">{selectedTemplateUser?.name ?? '—'}</p>
+                    <p className="truncate text-xs text-muted-foreground">{selectedTemplateUser?.email ?? 'Aguardando seleção'}</p>
+                  </div>
+                </div>
+
+                {templateLoading ? (
+                  <div className="flex items-center gap-2 rounded-xl border border-border/70 bg-muted/30 p-4 text-sm text-muted-foreground">
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    Carregando modelos do cliente...
+                  </div>
+                ) : (
+                  <>
+                    <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                      <div className="space-y-2">
+                        <Label>Modelo da O.S.</Label>
+                        <Select
+                          value={templateDraft.osModelo}
+                          onValueChange={(value) => setTemplateDraft((current) => ({ ...current, osModelo: value as OsTemplateMode }))}
+                        >
+                          <SelectTrigger className="h-11">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="auto">Automático pela quantidade de serviços</SelectItem>
+                            <SelectItem value="a5_duplo">Sempre A5 duplo</SelectItem>
+                            <SelectItem value="a4_vertical">Sempre A4 vertical</SelectItem>
+                          </SelectContent>
+                        </Select>
+                        <p className="text-xs text-muted-foreground">
+                          Automático usa A5 duplo até 7 itens e A4 vertical quando a O.S. fica maior.
+                        </p>
+                      </div>
+
+                      <div className="space-y-2">
+                        <Label>Modelo do fechamento</Label>
+                        <Select
+                          value={templateDraft.fechamentoModelo}
+                          onValueChange={(value) => setTemplateDraft((current) => ({ ...current, fechamentoModelo: value as ClosingTemplateMode }))}
+                        >
+                          <SelectTrigger className="h-11">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="moderno">Moderno com cartões e destaques</SelectItem>
+                            <SelectItem value="compacto">Compacto para impressão direta</SelectItem>
+                          </SelectContent>
+                        </Select>
+                        <p className="text-xs text-muted-foreground">
+                          A configuração fica registrada para o cliente e poderá ser usada nos PDFs finais.
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                      <div className="space-y-3 rounded-2xl border border-border/70 p-4">
+                        <div>
+                          <Label>Cor da O.S.</Label>
+                          <p className="mt-1 text-xs text-muted-foreground">Cabeçalhos e destaques da nota de serviço.</p>
+                        </div>
+                        <div className="flex flex-wrap gap-3">
+                          {DOC_ACCENT_PRESETS.map((preset) => (
+                            <button
+                              key={`os-${preset.color}`}
+                              type="button"
+                              onClick={() => setTemplateDraft((current) => ({ ...current, corDocumento: preset.color }))}
+                              className={`h-10 w-10 rounded-xl transition-all hover:scale-110 ${templateDraft.corDocumento === preset.color ? 'ring-2 ring-offset-2 ring-primary scale-110' : ''}`}
+                              style={{ backgroundColor: preset.color }}
+                              aria-label={`Selecionar cor ${preset.name} para O.S.`}
+                              title={preset.name}
+                            />
+                          ))}
+                        </div>
+                        <Input
+                          value={templateDraft.corDocumento}
+                          onChange={(event) => setTemplateDraft((current) => ({ ...current, corDocumento: event.target.value }))}
+                          className="font-mono"
+                          maxLength={7}
+                        />
+                      </div>
+
+                      <div className="space-y-3 rounded-2xl border border-border/70 p-4">
+                        <div>
+                          <Label>Cor do fechamento</Label>
+                          <p className="mt-1 text-xs text-muted-foreground">Destaques do PDF de fechamento mensal.</p>
+                        </div>
+                        <div className="flex flex-wrap gap-3">
+                          {DOC_ACCENT_PRESETS.map((preset) => (
+                            <button
+                              key={`closing-${preset.color}`}
+                              type="button"
+                              onClick={() => setTemplateDraft((current) => ({ ...current, corFechamento: preset.color }))}
+                              className={`h-10 w-10 rounded-xl transition-all hover:scale-110 ${templateDraft.corFechamento === preset.color ? 'ring-2 ring-offset-2 ring-primary scale-110' : ''}`}
+                              style={{ backgroundColor: preset.color }}
+                              aria-label={`Selecionar cor ${preset.name} para fechamento.`}
+                              title={preset.name}
+                            />
+                          ))}
+                        </div>
+                        <Input
+                          value={templateDraft.corFechamento}
+                          onChange={(event) => setTemplateDraft((current) => ({ ...current, corFechamento: event.target.value }))}
+                          className="font-mono"
+                          maxLength={7}
+                        />
+                      </div>
+                    </div>
+
+                    <div className="flex flex-col gap-3 rounded-2xl border border-border/70 bg-muted/30 p-4 sm:flex-row sm:items-center sm:justify-between">
+                      <div>
+                        <p className="text-sm font-semibold">Configuração atual</p>
+                        <p className="text-xs text-muted-foreground">
+                          O.S.: {templateDraft.osModelo} · Fechamento: {templateDraft.fechamentoModelo} · Cores: {templateDraft.corDocumento} / {templateDraft.corFechamento}
+                        </p>
+                      </div>
+                      <Button onClick={() => void handleSaveTemplateSettings()} disabled={templateSaving || !selectedTemplateUserId} className="gap-2">
+                        {templateSaving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />}
+                        Atualizar modelos
+                      </Button>
+                    </div>
+                  </>
                 )}
+
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                   <div className="border-2 rounded-xl p-5 hover:border-primary/30 transition-all">
                     <div className="flex items-center gap-3 mb-3">
@@ -411,40 +1045,132 @@ export default function SettingsPage() {
             <Card>
               <CardHeader>
                 <CardTitle className="text-base flex items-center gap-2">
-                  <Palette className="w-4 h-4" /> Cor de Destaque do Documento
-                  <Badge variant="outline">Prévia local</Badge>
+                  <Palette className="w-4 h-4" /> Prévia das Cores
+                  <Badge variant="outline">Tempo real</Badge>
                 </CardTitle>
               </CardHeader>
               <CardContent className="space-y-4">
-                <p className="text-sm text-muted-foreground">Escolha a cor principal usada nos cabeçalhos e destaques do documento impresso.</p>
-                <div className="flex gap-3 flex-wrap">
-                  {DOC_ACCENT_PRESETS.map(p => (
-                    <button
-                      key={p.color}
-                      onClick={() => { setDocAccentColor(p.color); toast({ title: `Prévia local da cor "${p.name}" selecionada` }); }}
-                      className={`w-10 h-10 rounded-xl transition-all hover:scale-110 ${docAccentColor === p.color ? 'ring-2 ring-offset-2 ring-primary scale-110' : ''}`}
-                      style={{ backgroundColor: p.color }}
-                      title={p.name}
-                    />
-                  ))}
-                </div>
-                <p className="text-xs text-muted-foreground">
-                  Cor da prévia local: <span className="font-mono font-semibold">{docAccentColor}</span>
+                <p className="text-sm text-muted-foreground">
+                  Use os botões de visualização para conferir a O.S. no padrão do cliente selecionado antes de salvar.
                 </p>
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  <div className="rounded-2xl border border-border/70 p-4" style={{ borderTopColor: templateDraft.corDocumento, borderTopWidth: 4 }}>
+                    <p className="text-sm font-semibold">O.S.</p>
+                    <p className="text-xs text-muted-foreground">Modelo: {templateDraft.osModelo}</p>
+                    <p className="mt-2 font-mono text-xs" style={{ color: templateDraft.corDocumento }}>{templateDraft.corDocumento}</p>
+                  </div>
+                  <div className="rounded-2xl border border-border/70 p-4" style={{ borderTopColor: templateDraft.corFechamento, borderTopWidth: 4 }}>
+                    <p className="text-sm font-semibold">Fechamento</p>
+                    <p className="text-xs text-muted-foreground">Modelo: {templateDraft.fechamentoModelo}</p>
+                    <p className="mt-2 font-mono text-xs" style={{ color: templateDraft.corFechamento }}>{templateDraft.corFechamento}</p>
+                  </div>
+                </div>
               </CardContent>
             </Card>
           </div>
 
           {(showA5Preview || showA4Preview) && (
             <Suspense fallback={null}>
-              <OSPreviewModal open={showA5Preview} onClose={() => setShowA5Preview(false)} note={mockNote} client={mockClient} services={mockServicesShort} products={[]} accentColor={docAccentColor} />
-              <OSPreviewModal open={showA4Preview} onClose={() => setShowA4Preview(false)} note={{ ...mockNote, totalAmount: 2500 }} client={mockClient} services={mockServicesLong} products={[]} accentColor={docAccentColor} />
+              <OSPreviewModal
+                open={showA5Preview}
+                onClose={() => setShowA5Preview(false)}
+                note={mockNote}
+                client={mockClient}
+                services={mockServicesShort}
+                products={[]}
+                accentColor={templateDraft.corDocumento}
+                templateMode="a5_duplo"
+              />
+              <OSPreviewModal
+                open={showA4Preview}
+                onClose={() => setShowA4Preview(false)}
+                note={{ ...mockNote, totalAmount: 2500 }}
+                client={mockClient}
+                services={mockServicesLong}
+                products={[]}
+                accentColor={templateDraft.corDocumento}
+                templateMode="a4_vertical"
+              />
             </Suspense>
           )}
         </TabsContent>
 
         {/* SEGURANÇA */}
         <TabsContent value="seguranca">
+          <div className="space-y-5">
+          {isSuperAdmin && (
+            <Card>
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2">
+                  <KeyRound className="w-5 h-5" /> Reset de senha de cliente
+                  <Badge variant="outline">Supabase Auth</Badge>
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-5">
+                <Alert>
+                  <Shield className="h-4 w-4" />
+                  <AlertTitle>Fluxo seguro pelo Admin master</AlertTitle>
+                  <AlertDescription>
+                    Selecione o cliente/usuário e reenvie o e-mail de recuperação. O link de troca de senha vai somente para o e-mail principal da conta; o e-mail extra recebe apenas uma confirmação administrativa.
+                  </AlertDescription>
+                </Alert>
+
+                <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_240px]">
+                  <div className="space-y-2">
+                    <Label>Cliente / usuário</Label>
+                    <Select
+                      value={selectedResetUserId}
+                      onValueChange={setSelectedResetUserId}
+                      disabled={usersLoading || systemUsers.length === 0 || resetSending}
+                    >
+                      <SelectTrigger className="h-11">
+                        <SelectValue placeholder={usersLoading ? 'Carregando usuários...' : 'Selecione um usuário'} />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {systemUsers.map((systemUser) => (
+                          <SelectItem key={systemUser.id} value={systemUser.id}>
+                            {systemUser.name} · {systemUser.email}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+
+                  <div className="rounded-xl border border-border/70 bg-muted/30 p-3">
+                    <p className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">Reset será enviado para</p>
+                    <p className="mt-1 truncate text-sm font-semibold">
+                      {systemUsers.find((candidate) => candidate.id === selectedResetUserId)?.email ?? '—'}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="space-y-2">
+                  <Label>E-mail alternativo de confirmação (opcional)</Label>
+                  <Input
+                    type="email"
+                    value={resetConfirmationEmail}
+                    onChange={(event) => setResetConfirmationEmail(event.target.value)}
+                    placeholder="exemplo@cliente.com"
+                    disabled={resetSending}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    Este endereço recebe apenas a confirmação de que o reset foi solicitado. O link de redefinição não é enviado para e-mail alternativo.
+                  </p>
+                </div>
+
+                <Button
+                  variant="destructive"
+                  onClick={() => void handleAdminPasswordReset()}
+                  disabled={resetSending || !selectedResetUserId}
+                  className="gap-2"
+                >
+                  {resetSending ? <Loader2 className="h-4 w-4 animate-spin" /> : <KeyRound className="h-4 w-4" />}
+                  Reenviar reset de senha
+                </Button>
+              </CardContent>
+            </Card>
+          )}
+
           <Card>
             <CardHeader>
               <CardTitle className="flex items-center gap-2">
@@ -470,6 +1196,7 @@ export default function SettingsPage() {
               </Button>
             </CardContent>
           </Card>
+          </div>
         </TabsContent>
 
         {/* USUÁRIOS */}
