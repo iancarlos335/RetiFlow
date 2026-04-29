@@ -23,23 +23,27 @@ const DEFAULT_MODULE_ORDER: Record<SystemUser['role'], AppModuleKey[]> = {
   RECEPCAO: ['dashboard', 'clients', 'notes', 'kanban'],
 };
 
-function shouldUseRealModuleAccess(user: SystemUser) {
-  if (!user.moduleAccess) return false;
-  return DEFAULT_MODULE_ORDER[user.role].some((moduleKey) => {
-    if (user.role === 'ADMIN' && moduleKey === 'admin') return true;
-    return user.moduleAccess?.[moduleKey] === true && hasPermission(user, getModulePermission(moduleKey));
-  });
+const ALL_MODULES: AppModuleKey[] = ['dashboard', 'clients', 'notes', 'kanban', 'closing', 'payables', 'invoices', 'settings', 'admin'];
+const OPERATIONAL_MODULES: AppModuleKey[] = ALL_MODULES.filter((moduleKey) => moduleKey !== 'admin');
+
+interface DefaultRedirectOptions {
+  /**
+   * Usado quando um Master entra pelo portal operacional para testar o sistema
+   * como usuário de operação, sem cair automaticamente no painel administrativo.
+   */
+  operationalOnly?: boolean;
 }
 
 export function canUserAccessModule(user: SystemUser | null, moduleKey: AppModuleKey) {
   if (!user) return false;
-  if (user.role === 'ADMIN' && moduleKey === 'admin') return true;
+  if (user.role === 'ADMIN' && moduleKey === 'admin') {
+    return user.moduleAccess ? user.moduleAccess.admin !== false : true;
+  }
 
-  const permission = getModulePermission(moduleKey);
-  if (!hasPermission(user, permission)) return false;
-  const useRealModuleAccess = shouldUseRealModuleAccess(user);
-  if (useRealModuleAccess && user.moduleAccess?.[moduleKey] === false) return false;
-  if (useRealModuleAccess) return true;
+  if (user.moduleAccess) {
+    if (moduleKey === 'admin') return false;
+    return user.moduleAccess[moduleKey] === true;
+  }
 
   // No explicit DB module access — fall back to role-based defaults.
   // In real auth mode, use the static role config to prevent localStorage manipulation
@@ -48,13 +52,22 @@ export function canUserAccessModule(user: SystemUser | null, moduleKey: AppModul
     return DEFAULT_ROLE_MODULE_CONFIG[user.role]?.[moduleKey] !== false;
   }
 
+  const permission = getModulePermission(moduleKey);
+  if (!hasPermission(user, permission)) return false;
+
   // In mock/dev mode, respect localStorage-based config with per-user overrides.
   if (!isRoleModuleEnabled(user.role, moduleKey)) return false;
   if (!isUserModuleEnabled(user.id, moduleKey)) return false;
   return true;
 }
 
-export function getDefaultRedirect(user: SystemUser) {
-  const moduleKey = DEFAULT_MODULE_ORDER[user.role].find((candidate) => canUserAccessModule(user, candidate));
+export function getDefaultRedirect(user: SystemUser, options: DefaultRedirectOptions = {}) {
+  const orderedModules = user.moduleAccess
+    ? Array.from(new Set([...DEFAULT_MODULE_ORDER[user.role], ...ALL_MODULES]))
+    : DEFAULT_MODULE_ORDER[user.role];
+  const candidateModules = options.operationalOnly
+    ? orderedModules.filter((candidate) => OPERATIONAL_MODULES.includes(candidate))
+    : orderedModules;
+  const moduleKey = candidateModules.find((candidate) => canUserAccessModule(user, candidate));
   return moduleKey ? MODULE_PATHS[moduleKey] : '/acesso-negado';
 }
